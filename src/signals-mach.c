@@ -120,7 +120,21 @@ enum x86_trap_flags {
     PAGE_PRESENT = 0x1
 };
 
-void jl_throw_in_thread(int tid, mach_port_t thread, jl_value_t *exception)
+static void jl_call_in_state(x86_thread_state64_t *state, uint64_t stack_top,
+                             void (*fptr)(void))
+{
+    uint64_t rsp = stack_top;
+    rsp &= -16; // ensure 16-byte alignment
+
+    // push (null) $RIP onto the stack
+    rsp -= sizeof(void*);
+    *(void**)rsp = NULL;
+
+    state->__rsp = rsp; // set stack pointer
+    state->__rip = (uint64_t)fptr; // "call" the function
+}
+
+static void jl_throw_in_thread(int tid, mach_port_t thread, jl_value_t *exception)
 {
     unsigned int count = MACHINE_THREAD_STATE_COUNT;
     x86_thread_state64_t state;
@@ -131,18 +145,10 @@ void jl_throw_in_thread(int tid, mach_port_t thread, jl_value_t *exception)
     ptls2->bt_size = rec_backtrace_ctx(ptls2->bt_data, JL_MAX_BT_SIZE,
                                        (bt_context_t*)&state);
     ptls2->exception_in_transit = exception;
-
-    uint64_t rsp = (uint64_t)ptls2->signal_stack + sig_stack_size;
-    rsp &= -16; // ensure 16-byte alignment
-
-    // push (null) $RIP onto the stack
-    rsp -= sizeof(void*);
-    *(void**)rsp = NULL;
-
-    state.__rsp = rsp; // set stack pointer
-    state.__rip = (uint64_t)&jl_rethrow; // "call" the function
-
-    ret = thread_set_state(thread, x86_THREAD_STATE64, (thread_state_t)&state, count);
+    jl_call_in_state(&state, (uint64_t)ptls2->signal_stack + sig_stack_size,
+                     &jl_rethrow);
+    ret = thread_set_state(thread, x86_THREAD_STATE64,
+                           (thread_state_t)&state, count);
     HANDLE_MACH_ERROR("thread_set_state",ret);
 }
 
@@ -299,6 +305,42 @@ static void jl_try_deliver_sigint(void)
     else {
         jl_wake_libuv();
     }
+
+    ret = thread_resume(thread);
+    HANDLE_MACH_ERROR("thread_resume", ret);
+}
+
+static void jl_exit_thread0(int exitstate)
+{
+    jl_ptls_t ptls2 = jl_all_tls_states[0];
+    mach_port_t thread = pthread_mach_thread_np(ptls2->system_id);
+    kern_return_t ret = thread_suspend(thread);
+    HANDLE_MACH_ERROR("thread_suspend", ret);
+
+    // This abort `sleep` and other syscall.
+    ret = thread_abort(thread);
+    HANDLE_MACH_ERROR("thread_abort", ret);
+
+    unsigned int count = MACHINE_THREAD_STATE_COUNT;
+    x86_thread_state64_t state;
+    ret = thread_get_state(thread, x86_THREAD_STATE64,
+                           (thread_state_t)&state, &count);
+
+    void (*exit_func)(int) = _exit;
+    if (thread0_exit_count <= 1) {
+        exit_func = &jl_exit;
+    }
+    else if (thread0_exit_count == 2) {
+        exit_func = &exit;
+    }
+
+    // First integer argument. Not portable but good enough =)
+    state.__rdi = exitstate;
+    // 128 bytes red zone.
+    jl_call_in_state(&state, state.__rsp - 128, (void (*)(void))exit_func);
+    ret = thread_set_state(thread, x86_THREAD_STATE64,
+                           (thread_state_t)&state, count);
+    HANDLE_MACH_ERROR("thread_set_state",ret);
 
     ret = thread_resume(thread);
     HANDLE_MACH_ERROR("thread_resume", ret);

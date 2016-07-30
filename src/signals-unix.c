@@ -46,17 +46,59 @@ static bt_context_t *jl_to_bt_context(void *sigctx)
 #endif
 }
 
-static void JL_NORETURN jl_throw_in_ctx(jl_value_t *e, void *sigctx)
+static int thread0_exit_count = 0;
+
+static void jl_call_in_ctx(void (*fptr)(void), void *_ctx)
+{
+#if defined(_OS_LINUX_) && defined(_CPU_X86_64_)
+    ucontext_t *ctx = (ucontext_t*)_ctx;
+    uintptr_t rsp = ctx->uc_mcontext.gregs[REG_RSP];
+    rsp &= -16; // ensure 16-byte alignment
+    rsp -= sizeof(void*);
+    *(void**)rsp = NULL;
+    ctx->uc_mcontext.gregs[REG_RSP] = rsp;
+    ctx->uc_mcontext.gregs[REG_RIP] = (uintptr_t)fptr;
+#elif defined(_OS_LINUX_) && defined(_CPU_X86_)
+    ucontext_t *ctx = (ucontext_t*)_ctx;
+    uintptr_t rsp = ctx->uc_mcontext.gregs[REG_ESP];
+    rsp &= -16; // ensure 16-byte alignment
+    rsp -= sizeof(void*);
+    *(void**)rsp = NULL;
+    ctx->uc_mcontext.gregs[REG_ESP] = rsp;
+    ctx->uc_mcontext.gregs[REG_EIP] = (uintptr_t)fptr;
+#elif defined(_OS_LINUX_) && defined(_CPU_AARCH64_)
+    ucontext_t *ctx = (ucontext_t*)_ctx;
+    uintptr_t rsp = ctx->uc_mcontext.sp;
+    rsp &= -16; // ensure 16-byte alignment
+    ctx->uc_mcontext.regs[29] = 0; // link register
+    ctx->uc_mcontext.sp = rsp;
+    ctx->uc_mcontext.pc = (uintptr_t)fptr;
+#elif defined(_OS_LINUX_) && defined(_CPU_ARM_)
+    ucontext_t *ctx = (ucontext_t*)_ctx;
+    uintptr_t rsp = ctx->uc_mcontext.arm_sp;
+    rsp &= -16; // ensure 16-byte alignment
+    ctx->uc_mcontext.arm_lr = 0; // link register
+    ctx->uc_mcontext.arm_sp = rsp;
+    ctx->uc_mcontext.arm_pc = (uintptr_t)fptr;
+#else
+    fptr();
+#endif
+}
+
+static void jl_throw_in_ctx(jl_value_t *e, void *sigctx)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
     if (!ptls->safe_restore)
         ptls->bt_size = rec_backtrace_ctx(ptls->bt_data, JL_MAX_BT_SIZE,
                                           jl_to_bt_context(sigctx));
     ptls->exception_in_transit = e;
-    // TODO throw the error by modifying sigctx for supported platforms
-    // This will avoid running the atexit handler on the signal stack
-    // if no excepiton handler is registered.
-    jl_rethrow();
+    // Do not use the main stack if this is a stack overflow since that will
+    // not work....
+    if (e == jl_stackovf_exception)
+        jl_rethrow();
+    // Otherwise, try hard to throw the signal using the main stack since
+    // it is more likely to work.
+    jl_call_in_ctx(&jl_rethrow, sigctx);
 }
 
 static pthread_t signals_thread;
@@ -199,11 +241,39 @@ static void jl_try_deliver_sigint(void)
     pthread_kill(ptls2->system_id, SIGUSR2);
 }
 
+// Write only by signal handling thread, read only by main thread
+// no sync necessary.
+static int thread0_exit_state = 0;
+static void jl_exit_thread0_cb(void)
+{
+    // This can get stuck if it happens at a unfortunate spot
+    // (unavoidable due to it's async nature).
+    // Try harder to exit each time if we get mutliple exit requests.
+    if (thread0_exit_count <= 1) {
+        jl_exit(thread0_exit_state);
+    }
+    else if (thread0_exit_count == 2) {
+        exit(thread0_exit_state);
+    }
+    else {
+        _exit(thread0_exit_state);
+    }
+}
+
+static void jl_exit_thread0(int state)
+{
+    jl_ptls_t ptls2 = jl_all_tls_states[0];
+    thread0_exit_state = state;
+    jl_atomic_store_release(&ptls2->signal_request, 3);
+    pthread_kill(ptls2->system_id, SIGUSR2);
+}
+
 // request:
 // 0: nothing
 // 1: get state
-// 3: throw sigint if `!defer_signal && io_wait` or if force throw threshold
+// 2: throw sigint if `!defer_signal && io_wait` or if force throw threshold
 //    is reached
+// 3: exit with `thread0_exit_state`
 void usr2_handler(int sig, siginfo_t *info, void *ctx)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
@@ -231,6 +301,10 @@ void usr2_handler(int sig, siginfo_t *info, void *ctx)
             jl_clear_force_sigint();
             jl_throw_in_ctx(jl_interrupt_exception, ctx);
         }
+    }
+    else if (request == 3) {
+        jl_unblock_signal(sig);
+        jl_call_in_ctx(jl_exit_thread0_cb, ctx);
     }
 }
 
@@ -406,6 +480,15 @@ static void *signal_listener(void *arg)
         critical |= (sig == SIGUSR1 && !profile);
 #endif
 
+        int doexit = critical;
+#ifdef SIGINFO
+        if (sig == SIGINFO)
+            doexit = 0;
+#else
+        if (sig == SIGUSR1)
+            doexit = 0;
+#endif
+
         bt_size = 0;
         // sample each thread, round-robin style in reverse order
         // (so that thread zero gets notified last)
@@ -445,18 +528,13 @@ static void *signal_listener(void *arg)
         // and must be thread-safe, but not necessarily signal-handler safe
         if (critical) {
             jl_critical_error(sig, NULL, bt_data, &bt_size);
-            // FIXME
-            // It is unsafe to run the exit handler on this thread
-            // (this thread is not managed and has a rather limited stack space)
-            // try harder to run this on a managed thread.
-#ifdef SIGINFO
-            if (sig != SIGINFO)
-#else
-            if (sig != SIGUSR1)
-#endif
-                jl_exit(128 + sig);
+            if (doexit) {
+                thread0_exit_count++;
+                jl_exit_thread0(128 + sig);
+            }
         }
     }
+    return NULL;
 }
 
 void restore_signals(void)
