@@ -2,8 +2,8 @@
 
 module Types
 
-export VersionInterval, VersionSet, Requires, Available, Fixed, merge_requires!, satisfies
-import Base: show, isempty, in, intersect, ==, hash, deepcopy_internal
+export VersionInterval, VersionSet, iscontiguous, Requires, Available, Fixed, merge_requires!, satisfies
+import Base: show, isempty, in, intersect, ==, hash, deepcopy_internal, maximum
 
 immutable VersionInterval
     lower::VersionNumber
@@ -49,6 +49,8 @@ end
 ==(A::VersionSet, B::VersionSet) = A.intervals == B.intervals
 hash(s::VersionSet, h::UInt) = hash(s.intervals, h + (0x2fd2ca6efa023f44 % UInt))
 deepcopy_internal(vs::VersionSet, ::ObjectIdDict) = VersionSet(copy(vs.intervals))
+iscontiguous(vs::VersionSet) = length(vs.intervals) == 1
+maximum(vs::VersionSet) = vs.intervals[end].upper
 
 typealias Requires Dict{String,VersionSet}
 

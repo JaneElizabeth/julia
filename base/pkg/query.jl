@@ -197,11 +197,6 @@ end
 # the allowed range (checking for impossible ranges while at it).
 # This is a pre-pruning step, so it also creates some structures which are later used by pruning
 function filter_versions(reqs::Requires, deps::Dict{String,Dict{VersionNumber,Available}})
-    # To each version in each package, we associate a BitVector.
-    # It is going to hold a pattern such that all versions with
-    # the same pattern are equivalent.
-    vmask = Dict{String,Dict{VersionNumber, BitVector}}()
-
     # Parse requirements and store allowed versions.
     allowed = Dict{String,Dict{VersionNumber, Bool}}()
     for (p,vs) in reqs
@@ -228,7 +223,7 @@ function filter_versions(reqs::Requires, deps::Dict{String,Dict{VersionNumber,Av
         end
     end
 
-    return filtered_deps, allowed, vmask
+    return filtered_deps, allowed
 end
 
 # Reduce the number of versions by creating equivalence classes, and retaining
@@ -239,7 +234,12 @@ end
 #   2) They have the same dependencies
 # Preliminarily calls filter_versions.
 function prune_versions(reqs::Requires, deps::Dict{String,Dict{VersionNumber,Available}})
-    filtered_deps, allowed, vmask = filter_versions(reqs, deps)
+    filtered_deps, allowed = filter_versions(reqs, deps)
+
+    # To each version in each package, we associate a BitVector.
+    # It is going to hold a pattern such that all versions with
+    # the same pattern are equivalent.
+    vmask = Dict{String,Dict{VersionNumber, BitVector}}()
 
     # For each package, we examine the dependencies of its versions
     # and put together those which are equal.
@@ -249,10 +249,10 @@ function prune_versions(reqs::Requires, deps::Dict{String,Dict{VersionNumber,Ava
 
         # Extract unique dependencies lists (aka classes), thereby
         # assigning an index to each class.
-        uniqdepssets = unique(values(fdepsp))
+        uniqdepssets = unique(a.requires for a in values(fdepsp))
 
         # Store all dependencies seen so far for later use
-        for a in uniqdepssets, (rp,rvs) in a.requires
+        for r in uniqdepssets, (rp,rvs) in r
             haskey(alldeps, rp) || (alldeps[rp] = Set{VersionSet}())
             push!(alldeps[rp], rvs)
         end
@@ -271,11 +271,42 @@ function prune_versions(reqs::Requires, deps::Dict{String,Dict{VersionNumber,Ava
             vmaskp[vn] = falses(luds)
         end
         for (vn,a) in fdepsp
-            vmind = findfirst(uniqdepssets, a)
-            @assert vmind >= 0
+            vmind = findfirst(uniqdepssets, a.requires)
+            @assert vmind > 0
             vm = vmaskp[vn]
             vm[vmind] = true
         end
+    end
+
+    # If 1) a package appears in two dependency requirements which
+    # have the same upper bound, and one is a subset of the other
+    # and is contiguous (a single interval), and if 2) all versions
+    # in both sets in turn have the same requirements on other packages,
+    # then there is no reason to choose a version outside of the smaller
+    # set. The following for loop checks the first part of this condition,
+    # the second one being left to the part of the vmask which was computed
+    # above.
+    for p in keys(alldeps)
+        alldepsp = alldeps[p]
+        alldepspnew = VersionSet[]
+        for vs in alldepsp
+            do_push = true
+            for k = 1:length(alldepspnew)
+                vs1 = alldepspnew[k]
+                maximum(vs1) != maximum(vs) && continue
+                intvs = intersect(vs, vs1)
+                if iscontiguous(vs) && intvs == vs
+                    alldepspnew[k] = vs
+                    do_push = false
+                    break
+                elseif iscontiguous(vs1) && intvs == vs1
+                    do_push = false
+                    break
+                end
+            end
+            do_push && push!(alldepspnew, vs)
+        end
+        alldeps[p] = Set{VersionSet}(alldepspnew)
     end
 
     # Produce dependency patterns.
@@ -291,7 +322,7 @@ function prune_versions(reqs::Requires, deps::Dict{String,Dict{VersionNumber,Ava
         @assert haskey(vmask, p)
         vmaskp = vmask[p]
         for (vn,vm) in vmaskp
-            push!(vm, in(vn, vs))
+            push!(vm, vn in vs)
         end
     end
 
@@ -302,7 +333,7 @@ function prune_versions(reqs::Requires, deps::Dict{String,Dict{VersionNumber,Ava
     for (p, vmaskp) in vmask
         vmask0_uniq = unique(values(vmaskp))
         nc = length(vmask0_uniq)
-        classes = [ VersionNumber[] for c0 = 1:nc ]
+        classes = [VersionNumber[] for c0 = 1:nc]
         for (vn,vm) in vmaskp
             c0 = findfirst(vmask0_uniq, vm)
             push!(classes[c0], vn)
@@ -452,7 +483,7 @@ end
 
 function filter_dependencies(reqs::Requires, deps::Dict{String,Dict{VersionNumber,Available}})
     deps = dependencies_subset(deps, Set{String}(keys(reqs)))
-    deps, _, _ = filter_versions(reqs, deps)
+    deps, _ = filter_versions(reqs, deps)
 
     return deps
 end
